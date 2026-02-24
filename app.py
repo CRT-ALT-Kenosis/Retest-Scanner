@@ -92,7 +92,7 @@ div[data-testid="stSidebar"] { background-color: #0d1117; border-right: 1px soli
 
 # ── Header ────────────────────────────────────────────────────────────────────
 st.markdown('<div class="main-title">📡 Institutional Retest Scanner</div>', unsafe_allow_html=True)
-st.markdown('<div class="subtitle">Finviz Pre-Filter · Weekly 200-SMA Retest · Daily Confirmation · Volume Surge</div>', unsafe_allow_html=True)
+st.markdown('<div class="subtitle">TradingView Pre-Filter · Weekly 200-SMA Retest · Daily Confirmation · Volume Surge</div>', unsafe_allow_html=True)
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -116,7 +116,7 @@ with st.sidebar:
 
     st.markdown('<div class="section-header">Universe</div>', unsafe_allow_html=True)
     universe_choice = st.selectbox("Stock Universe", [
-        "Finviz Pre-Filter (recommended)",
+        "TradingView Pre-Filter (recommended)",
         "S&P 500 (505 stocks)",
         "Custom Tickers",
     ])
@@ -160,51 +160,67 @@ SP500_TICKERS = [
     "WTW","GWW","WYNN","XEL","XYL","YUM","ZBRA","ZBH","ZION","ZTS","TPL"
 ]
 
-# ── Finviz Scraper ────────────────────────────────────────────────────────────
-def scrape_finviz(url):
+# ── TradingView Screener API ──────────────────────────────────────────────────
+SECTOR_MAP = {
+    "Energy":             "Energy",
+    "Technology":         "Technology",
+    "Industrials":        "Industrials",
+    "Basic Materials":    "Basic Materials",
+    "Healthcare":         "Health Technology",
+    "Consumer Cyclical":  "Consumer Cyclical",
+    "Financial":          "Finance",
+    "Real Estate":        "Real Estate",
+    "Communication":      "Communication Services",
+    "Utilities":          "Utilities",
+    "Consumer Defensive": "Consumer Defensive",
+}
+
+def fetch_tradingview_tickers(
+    min_market_cap_b=1.0,
+    max_market_cap_b=None,
+    min_avg_vol=300_000,
+    perf_1y_min=-60.0,
+    perf_1y_max=-15.0,
+    sectors=None,
+    exchanges=("NASDAQ", "NYSE", "AMEX"),
+    max_results=500,
+):
+    url = "https://scanner.tradingview.com/america/scan"
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
-        "Referer": "https://finviz.com/",
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Origin": "https://www.tradingview.com",
+        "Referer": "https://www.tradingview.com/",
     }
-    from html.parser import HTMLParser
+    filters = [
+        {"left": "market_cap_basic", "operation": "greater", "right": int(min_market_cap_b * 1e9)},
+        {"left": "average_volume_10d_calc", "operation": "greater", "right": min_avg_vol},
+        {"left": "Perf.Y", "operation": "in_range", "right": [perf_1y_min, perf_1y_max]},
+        {"left": "exchange", "operation": "in_range", "right": list(exchanges)},
+    ]
+    if max_market_cap_b:
+        filters.append({"left": "market_cap_basic", "operation": "less", "right": int(max_market_cap_b * 1e9)})
+    if sectors:
+        tv_sectors = [SECTOR_MAP.get(s, s) for s in sectors]
+        filters.append({"left": "sector", "operation": "in_range", "right": tv_sectors})
 
-    class TickerParser(HTMLParser):
-        def __init__(self):
-            super().__init__()
-            self.tickers = []
-            self._capture = False
-        def handle_starttag(self, tag, attrs):
-            attrs_dict = dict(attrs)
-            if tag == "a" and attrs_dict.get("class") == "screener-link-primary":
-                self._capture = True
-        def handle_data(self, data):
-            if self._capture:
-                self.tickers.append(data.strip())
-                self._capture = False
-        def handle_endtag(self, tag):
-            self._capture = False
-
-    tickers = []
+    payload = {
+        "filter": filters,
+        "options": {"lang": "en"},
+        "symbols": {"query": {"types": []}, "tickers": []},
+        "columns": ["name", "close", "market_cap_basic", "average_volume_10d_calc", "Perf.Y", "sector"],
+        "sort": {"sortBy": "average_volume_10d_calc", "sortOrder": "desc"},
+        "range": [0, max_results],
+    }
     try:
-        for row_start in range(1, 601, 20):
-            paged_url = url + f"&r={row_start}"
-            r = requests.get(paged_url, headers=headers, timeout=15)
-            if r.status_code != 200:
-                break
-            parser = TickerParser()
-            parser.feed(r.text)
-            page_tickers = parser.tickers
-            if not page_tickers:
-                break
-            tickers.extend(page_tickers)
-            if len(page_tickers) < 20:
-                break
-            time.sleep(0.6)
-    except Exception:
-        pass
-    return list(dict.fromkeys(tickers))
+        r = requests.post(url, json=payload, headers=headers, timeout=20)
+        if r.status_code != 200:
+            return [], f"TradingView returned HTTP {r.status_code}"
+        rows = r.json().get("data", [])
+        tickers = [row["d"][0] for row in rows if re.match(r"^[A-Z]{1,5}$", str(row.get("d", [None])[0] or ""))]
+        return tickers, None
+    except Exception as e:
+        return [], str(e)
 
 # ── Tiingo + Analysis Helpers ─────────────────────────────────────────────────
 def get_tiingo_data(ticker, api_key, start_date, freq="daily"):
@@ -302,106 +318,109 @@ def score_setup(wr, dr):
     return pts
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab1, tab2 = st.tabs(["🔍  Step 1 — Finviz Pre-Filter", "🚀  Step 2 — Run Scanner"])
+tab1, tab2 = st.tabs(["🔍  Step 1 — TradingView Pre-Filter", "🚀  Step 2 — Run Scanner"])
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TAB 1 — FINVIZ
+# TAB 1 — TRADINGVIEW PRE-FILTER
 # ═══════════════════════════════════════════════════════════════════════════════
 with tab1:
-    st.markdown('<div class="section-header">Build Your Candidate List — Free, No API Quota Used</div>', unsafe_allow_html=True)
-    st.markdown("""
+    st.markdown('''
     <div class="info-box">
-    Finviz screens 8,000+ stocks for free using pre-market structural filters — big prior run, deep correction,
-    sector focus — so your Tiingo quota is spent only on genuine candidates.
+    Uses TradingView's screener API to pull stocks matching your structural criteria — market cap $1B+,
+    in a correction, with enough volume — before touching any Tiingo quota.
     <br><br>
-    <b style="color:#f59e0b">Workflow:</b>&nbsp; Configure filters below → Auto-fetch tickers → Switch to Scanner tab → Run
+    <b style="color:#f59e0b">Workflow:</b>&nbsp; Set filters → Fetch Tickers → Switch to Scanner tab → Run
     </div>
-    """, unsafe_allow_html=True)
+    ''', unsafe_allow_html=True)
 
     col_l, col_r = st.columns(2)
-    with col_l:
-        st.markdown('<div class="section-header">Price & Liquidity</div>', unsafe_allow_html=True)
-        min_price   = st.selectbox("Minimum share price ($)", [5, 10, 20, 50], index=2)
-        min_avg_vol = st.selectbox("Minimum avg daily volume (K shares)", [100, 200, 300, 500], index=2)
 
-        st.markdown('<div class="section-header">Market Cap</div>', unsafe_allow_html=True)
-        market_caps = st.multiselect("Include market caps", [
-            "Small ($300M–$2B)", "Mid ($2B–$10B)", "Large ($10B+)", "Mega ($200B+)"
-        ], default=["Mid ($2B–$10B)", "Large ($10B+)"])
+    with col_l:
+        st.markdown('<div class="section-header">Market Cap & Liquidity</div>', unsafe_allow_html=True)
+        min_mcap = st.selectbox("Minimum Market Cap ($B)", [1, 2, 5, 10], index=0,
+            help="$1B+ captures mid-caps where big-run-then-correct setups are most common")
+        max_mcap_options = {"No limit": None, "$10B": 10, "$50B": 50, "$200B": 200}
+        max_mcap_label = st.selectbox("Maximum Market Cap", list(max_mcap_options.keys()), index=0)
+        max_mcap = max_mcap_options[max_mcap_label]
+        min_vol_k = st.selectbox("Min Avg Daily Volume (shares)", [100_000, 200_000, 300_000, 500_000],
+            format_func=lambda x: f"{x//1000}K", index=1)
+        exchanges = st.multiselect("Exchanges", ["NYSE", "NASDAQ", "AMEX"],
+            default=["NYSE", "NASDAQ"])
 
     with col_r:
-        st.markdown('<div class="section-header">52-Week Performance (Correction Proxy)</div>', unsafe_allow_html=True)
-        perf_range = st.selectbox("52-week return bucket", [
-            "-20% to 0%   (mild pullback)",
-            "-40% to -20% (moderate correction) ← recommended",
-            "-60% to -40% (deep correction)",
-            "Down >60%    (extreme — higher risk)",
-        ], index=1)
+        st.markdown('<div class="section-header">Performance Filter (Correction Proxy)</div>', unsafe_allow_html=True)
+        perf_presets = {
+            "Mild pullback    (-15% to -20%)":   (-20,  -15),
+            "Moderate         (-40% to -15%) ← recommended": (-40, -15),
+            "Deep correction  (-60% to -40%)":   (-60,  -40),
+            "Extreme          (-80% to -60%)":   (-80,  -60),
+            "Custom range":                       None,
+        }
+        perf_choice = st.selectbox("1-Year Performance", list(perf_presets.keys()), index=1)
+        if perf_presets[perf_choice] is None:
+            c1, c2 = st.columns(2)
+            perf_min = c1.number_input("Min 1Y perf (%)", value=-60, min_value=-100, max_value=0)
+            perf_max = c2.number_input("Max 1Y perf (%)", value=-15, min_value=-100, max_value=0)
+        else:
+            perf_min, perf_max = perf_presets[perf_choice]
 
         st.markdown('<div class="section-header">Sector Focus</div>', unsafe_allow_html=True)
-        st.caption("Sectors that produce big-run-then-correct setups like TPL")
-        sectors = st.multiselect("Sectors", [
-            "Energy", "Technology", "Industrials", "Materials",
-            "Healthcare", "Consumer Cyclical", "Financial", "Real Estate",
-        ], default=["Energy", "Technology", "Industrials", "Materials"])
+        st.caption("Sectors that produce big-run-then-correct setups")
+        tv_sectors = st.multiselect("Sectors (leave empty = all sectors)", list(SECTOR_MAP.keys()),
+            default=["Energy", "Technology", "Industrials", "Basic Materials"])
 
-    # ── Build URL ────────────────────────────────────────────────────────────
-    price_codes = {5: "sh_price_o5", 10: "sh_price_o10", 20: "sh_price_o20", 50: "sh_price_o50"}
-    vol_codes   = {100: "sh_avgvol_o100", 200: "sh_avgvol_o200", 300: "sh_avgvol_o300", 500: "sh_avgvol_o500"}
-    perf_codes  = {
-        "-20% to 0%   (mild pullback)":                  "ta_perf2_-20to0",
-        "-40% to -20% (moderate correction) ← recommended": "ta_perf2_-40to-20",
-        "-60% to -40% (deep correction)":                "ta_perf2_-60to-40",
-        "Down >60%    (extreme — higher risk)":           "ta_perf2_u",
-    }
-    sector_codes = {
-        "Energy": "sec_energy", "Technology": "sec_technology",
-        "Industrials": "sec_industrials", "Materials": "sec_basicmaterials",
-        "Healthcare": "sec_healthcare", "Consumer Cyclical": "sec_consumercyclical",
-        "Financial": "sec_financial", "Real Estate": "sec_realestate",
-    }
-    cap_codes = {
-        "Small ($300M–$2B)": "cap_small", "Mid ($2B–$10B)": "cap_mid",
-        "Large ($10B+)": "cap_large", "Mega ($200B+)": "cap_mega",
-    }
+    # ── Fetch button ──────────────────────────────────────────────────────────
+    st.markdown('<div class="section-header">Fetch Tickers from TradingView</div>', unsafe_allow_html=True)
 
-    f_parts = []
-    if min_price   in price_codes: f_parts.append(price_codes[min_price])
-    if min_avg_vol in vol_codes:   f_parts.append(vol_codes[min_avg_vol])
-    if perf_range  in perf_codes:  f_parts.append(perf_codes[perf_range])
-    for s in sectors:
-        if s in sector_codes: f_parts.append(sector_codes[s])
-    for m in market_caps:
-        if m in cap_codes: f_parts.append(cap_codes[m])
+    # Show what will be sent
+    filter_summary_parts = [
+        f"Market cap ≥ ${min_mcap}B",
+        f"Max: {max_mcap_label}",
+        f"Avg vol ≥ {min_vol_k//1000}K",
+        f"1Y perf {perf_min}% to {perf_max}%",
+        f"Sectors: {', '.join(tv_sectors) if tv_sectors else 'All'}",
+        f"Exchanges: {', '.join(exchanges)}",
+    ]
+    st.markdown(
+        '<div style="font-family:Space Mono,monospace;font-size:0.7rem;color:#64748b;margin-bottom:1rem;">' +
+        " &nbsp;·&nbsp; ".join(filter_summary_parts) + '</div>',
+        unsafe_allow_html=True)
 
-    finviz_url = f"https://finviz.com/screener.ashx?v=111&f={','.join(f_parts)}&o=-volume"
+    max_tv_results = st.slider("Max results to fetch", 100, 1000, 400, step=50)
 
-    st.markdown('<div class="section-header">Generated Finviz URL</div>', unsafe_allow_html=True)
-    st.code(finviz_url, language=None)
-
-    btn_col, link_col, _ = st.columns([1, 1, 2])
-    with btn_col:
-        fetch_btn = st.button("⬇ Auto-Fetch Tickers")
-    with link_col:
-        st.markdown(f'<br><a href="{finviz_url}" target="_blank" style="color:#f59e0b;font-family:Space Mono,monospace;font-size:0.8rem;">🔗 Open in Finviz ↗</a>', unsafe_allow_html=True)
+    fetch_col, _ = st.columns([1, 3])
+    with fetch_col:
+        fetch_btn = st.button("⬇ Fetch Tickers from TradingView")
 
     if fetch_btn:
-        with st.spinner("Scraping Finviz — may take 10–30 seconds..."):
-            found = scrape_finviz(finviz_url)
-        if found:
+        with st.spinner("Querying TradingView screener..."):
+            found, err = fetch_tradingview_tickers(
+                min_market_cap_b=float(min_mcap),
+                max_market_cap_b=float(max_mcap) if max_mcap else None,
+                min_avg_vol=min_vol_k,
+                perf_1y_min=float(perf_min),
+                perf_1y_max=float(perf_max),
+                sectors=tv_sectors if tv_sectors else None,
+                exchanges=tuple(exchanges),
+                max_results=max_tv_results,
+            )
+        if err:
+            st.error(f"TradingView error: {err}")
+        elif found:
             st.session_state["finviz_tickers"] = found
-            st.success(f"✅ Fetched {len(found)} tickers — switch to the Scanner tab to run")
-            pills = " ".join([f'<span class="ticker-pill">{t}</span>' for t in found[:100]])
-            st.markdown(f'<div style="margin-top:0.5rem">{pills}{"&nbsp;..." if len(found) > 100 else ""}</div>', unsafe_allow_html=True)
+            st.success(f"✅ Fetched {len(found)} tickers from TradingView — switch to the Scanner tab to run")
+            pills = " ".join([f'<span class="ticker-pill">{t}</span>' for t in found[:120]])
+            st.markdown(f'<div style="margin-top:0.5rem">{pills}{"&nbsp;..." if len(found) > 120 else ""}</div>',
+                unsafe_allow_html=True)
         else:
-            st.warning("Finviz blocked the automated request (rate limit). Use the manual method below.")
+            st.warning("No tickers matched. Try broadening your filters.")
 
-    # ── Manual Fallback ───────────────────────────────────────────────────────
-    st.markdown('<div class="section-header">Manual Fallback — If Auto-Fetch is Blocked</div>', unsafe_allow_html=True)
+    # ── Manual paste fallback ─────────────────────────────────────────────────
+    st.markdown('<div class="section-header">Manual Fallback — Paste from TradingView or Any Screener</div>', unsafe_allow_html=True)
     st.markdown("""
-    <div class="step-box"><span class="step-num">1</span><span class="step-text">Click "Open in Finviz" above and run the screener in your browser</span></div>
-    <div class="step-box"><span class="step-num">2</span><span class="step-text">Click the <b>Export</b> button (top-right of results table) → open the downloaded CSV</span></div>
-    <div class="step-box"><span class="step-num">3</span><span class="step-text">Copy the entire Ticker column and paste it into the box below</span></div>
+    <div class="step-box"><span class="step-num">1</span><span class="step-text">Open TradingView Screener at <b>tradingview.com/screener</b> and apply your filters</span></div>
+    <div class="step-box"><span class="step-num">2</span><span class="step-text">Select all rows → Export → open CSV → copy the Symbol column</span></div>
+    <div class="step-box"><span class="step-num">3</span><span class="step-text">Paste tickers below and click Load</span></div>
     """, unsafe_allow_html=True)
 
     manual_paste = st.text_area("Paste tickers (comma, space, or newline separated)", height=100,
@@ -415,18 +434,16 @@ with tab1:
         else:
             st.error("No valid tickers found.")
 
-    # ── Show loaded list ──────────────────────────────────────────────────────
+    # ── Show loaded tickers ───────────────────────────────────────────────────
     if "finviz_tickers" in st.session_state:
         loaded = st.session_state["finviz_tickers"]
         st.markdown(f'<div class="section-header">Currently Loaded — {len(loaded)} Tickers</div>', unsafe_allow_html=True)
         pills = " ".join([f'<span class="ticker-pill">{t}</span>' for t in loaded[:120]])
         st.markdown(f'<div>{pills}{"&nbsp;..." if len(loaded) > 120 else ""}</div>', unsafe_allow_html=True)
-        st.download_button("⬇ Download Ticker List as CSV", ",".join(loaded), "finviz_tickers.csv", "text/csv")
-
+        st.download_button("⬇ Download Ticker List as CSV", ",".join(loaded), "tv_tickers.csv", "text/csv")
         if st.button("🗑 Clear Loaded Tickers"):
             del st.session_state["finviz_tickers"]
             st.rerun()
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TAB 2 — SCANNER
@@ -434,12 +451,12 @@ with tab1:
 with tab2:
 
     # Resolve universe
-    if universe_choice == "Finviz Pre-Filter (recommended)":
+    if universe_choice == "TradingView Pre-Filter (recommended)":
         scan_universe = st.session_state.get("finviz_tickers", [])
         if scan_universe:
-            st.info(f"📋 {len(scan_universe)} tickers loaded from Finviz pre-filter. Adjust filters in the Pre-Filter tab if needed.")
+            st.info(f"📋 {len(scan_universe)} tickers loaded from TradingView pre-filter. Adjust filters in the Pre-Filter tab if needed.")
         else:
-            st.warning("No Finviz tickers loaded yet. Go to **Step 1 — Finviz Pre-Filter** first, or switch Universe in the sidebar.")
+            st.warning("No tickers loaded yet. Go to **Step 1 — TradingView Pre-Filter** first, or switch Universe in the sidebar.")
     elif universe_choice == "Custom Tickers":
         scan_universe = [t.strip().upper() for t in custom_tickers_input.split(",") if t.strip()]
     else:
@@ -586,7 +603,7 @@ with tab2:
             <div style="background:#0f1a2e;border:1px solid #1e3a5f;border-radius:12px;padding:2.5rem;text-align:center;margin-top:1rem;">
                 <div style="font-size:2rem;margin-bottom:0.5rem;">⬅</div>
                 <div style="font-family:Space Mono,monospace;font-size:0.8rem;color:#94a3b8;">
-                    Go to <b style="color:#f59e0b">Step 1 — Finviz Pre-Filter</b> to build your candidate list first,<br>
+                    Go to <b style="color:#f59e0b">Step 1 — TradingView Pre-Filter</b> to build your candidate list first,<br>
                     then come back here and hit 🚀 Run Scanner.
                 </div>
             </div>
